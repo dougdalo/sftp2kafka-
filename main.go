@@ -6,12 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/joho/godotenv"
-	"github.com/pkg/sftp"
 	"github.com/segmentio/kafka-go"
-	"golang.org/x/crypto/ssh"
 	"io"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,11 +21,7 @@ type Line struct {
 }
 
 type Config struct {
-	SFTPUser        string
-	SFTPPassword    string
-	SFTPHost        string
-	SFTPPort        string
-	SFTPDir         string
+	LocalDir        string
 	HeadersFileName string
 	ArchiveDir      string
 	KafkaBrokers    []string
@@ -47,7 +40,7 @@ func main() {
 	printEnvDebug(cfg)
 
 	for {
-		err := processAllTxtFiles(cfg)
+		err := processAllTxtFilesLocal(cfg)
 		if err != nil {
 			log.Printf("Processamento falhou: %v", err)
 		}
@@ -57,37 +50,27 @@ func main() {
 
 func loadEnvVars() Config {
 	return Config{
-		SFTPUser:        os.Getenv("SFTP_USER"),
-		SFTPPassword:    os.Getenv("SFTP_PASSWORD"),
-		SFTPHost:        os.Getenv("SFTP_HOST"),
-		SFTPPort:        os.Getenv("SFTP_PORT"),
-		SFTPDir:         os.Getenv("SFTP_DIR"),
-		HeadersFileName: os.Getenv("SFTP_HEADERS_FILENAME"),
-		ArchiveDir:      os.Getenv("SFTP_ARCHIVE_DIR"),
+		LocalDir:        os.Getenv("LOCAL_DIR"),
+		HeadersFileName: os.Getenv("HEADERS_FILENAME"),
+		ArchiveDir:      os.Getenv("LOCAL_ARCHIVE_DIR"),
 		KafkaBrokers:    splitComma(os.Getenv("KAFKA_BROKERS")),
 		KafkaTopic:      os.Getenv("KAFKA_TOPIC"),
 		PollInterval:    10 * time.Second,
-		NumWorkers:      8,
-		BatchSize:       2000,
+		NumWorkers:      8,    // ajuste conforme CPU/infra
+		BatchSize:       2000, // ajuste conforme teste
 	}
 }
 
 func printEnvDebug(cfg Config) {
 	fmt.Printf("\nDEBUG VARS:\n"+
-		"SFTP_USER: %s\nSFTP_PASSWORD: %s\nSFTP_HOST: %s\nSFTP_PORT: %s\nSFTP_DIR: %s\nSFTP_HEADERS_FILENAME: %s\nSFTP_ARCHIVE_DIR: %s\nKAFKA_BROKERS: %v\nKAFKA_TOPIC: %s\nNUM_WORKERS: %d\nBATCH_SIZE: %d\n\n",
-		cfg.SFTPUser, cfg.SFTPPassword, cfg.SFTPHost, cfg.SFTPPort, cfg.SFTPDir, cfg.HeadersFileName, cfg.ArchiveDir, cfg.KafkaBrokers, cfg.KafkaTopic, cfg.NumWorkers, cfg.BatchSize)
+		"LOCAL_DIR: %s\nHEADERS_FILENAME: %s\nLOCAL_ARCHIVE_DIR: %s\nKAFKA_BROKERS: %v\nKAFKA_TOPIC: %s\nNUM_WORKERS: %d\nBATCH_SIZE: %d\n\n",
+		cfg.LocalDir, cfg.HeadersFileName, cfg.ArchiveDir, cfg.KafkaBrokers, cfg.KafkaTopic, cfg.NumWorkers, cfg.BatchSize)
 }
 
-func processAllTxtFiles(cfg Config) error {
-	sftpClient, err := connectSFTP(cfg)
+func processAllTxtFilesLocal(cfg Config) error {
+	files, err := os.ReadDir(cfg.LocalDir)
 	if err != nil {
-		return fmt.Errorf("erro conectando SFTP: %w", err)
-	}
-	defer sftpClient.Close()
-
-	files, err := sftpClient.ReadDir(cfg.SFTPDir)
-	if err != nil {
-		return fmt.Errorf("erro lendo diretório SFTP: %w", err)
+		return fmt.Errorf("erro lendo diretório local: %w", err)
 	}
 
 	countFiles := 0
@@ -97,7 +80,7 @@ func processAllTxtFiles(cfg Config) error {
 		}
 		if strings.HasSuffix(strings.ToLower(file.Name()), ".txt") {
 			countFiles++
-			err := processFileConcurrent(cfg, sftpClient, file.Name())
+			err := processFileLocalConcurrent(cfg, file.Name())
 			if err != nil {
 				log.Printf("Erro processando arquivo [%s]: %v", file.Name(), err)
 			}
@@ -105,19 +88,19 @@ func processAllTxtFiles(cfg Config) error {
 	}
 
 	if countFiles == 0 {
-		log.Printf("Nenhum arquivo .txt encontrado em %s", cfg.SFTPDir)
+		log.Printf("Nenhum arquivo .txt encontrado em %s", cfg.LocalDir)
 	}
 	return nil
 }
 
-func processFileConcurrent(cfg Config, sftpClient *sftp.Client, fileName string) error {
-	filePath := cfg.SFTPDir + fileName
-	headersPath := cfg.SFTPDir + cfg.HeadersFileName
+func processFileLocalConcurrent(cfg Config, fileName string) error {
+	filePath := filepath.Join(cfg.LocalDir, fileName)
+	headersPath := filepath.Join(cfg.LocalDir, cfg.HeadersFileName)
 
-	log.Printf("DEBUG: SFTP_DIR=%s, HEADERS_FILENAME=%s, ARQUIVO ATUAL: %s", cfg.SFTPDir, cfg.HeadersFileName, filePath)
+	log.Printf("DEBUG: LOCAL_DIR=%s, HEADERS_FILENAME=%s, ARQUIVO ATUAL: %s", cfg.LocalDir, cfg.HeadersFileName, filePath)
 
-	// Abre o arquivo via SFTP
-	file, err := sftpClient.Open(filePath)
+	// Abre o arquivo local
+	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("erro abrindo arquivo [%s]: %w", fileName, err)
 	}
@@ -125,7 +108,7 @@ func processFileConcurrent(cfg Config, sftpClient *sftp.Client, fileName string)
 
 	// Lê headers (do headers.txt ou gera automático)
 	var header []string
-	header, err = loadHeaders(sftpClient, headersPath)
+	header, err = loadHeadersLocal(headersPath)
 	if err != nil {
 		log.Printf("Não encontrou headers.txt, usando headers automáticos para [%s]...", fileName)
 		reader := csv.NewReader(file)
@@ -138,7 +121,6 @@ func processFileConcurrent(cfg Config, sftpClient *sftp.Client, fileName string)
 		for i := range firstLine {
 			header[i] = fmt.Sprintf("field%d", i+1)
 		}
-		// Volta o ponteiro pro começo do arquivo
 		_, errSeek := file.Seek(0, io.SeekStart)
 		if errSeek != nil {
 			return fmt.Errorf("erro ao voltar ponteiro do arquivo: %w", errSeek)
@@ -189,29 +171,29 @@ func processFileConcurrent(cfg Config, sftpClient *sftp.Client, fileName string)
 	log.Printf("Total de linhas lidas do arquivo [%s]: %d", fileName, linha-1)
 	log.Printf("Tempo total para processar arquivo [%s]: %s", fileName, time.Since(start))
 
-	// Move para archive como antes
-	err = sftpClient.MkdirAll(cfg.ArchiveDir)
+	// Move para archive
+	err = os.MkdirAll(cfg.ArchiveDir, 0777)
 	if err != nil {
 		log.Printf("Erro criando diretório archive: %v", err)
 	}
-	archivePath, err := findAvailableArchiveName(sftpClient, cfg.ArchiveDir, fileName)
+	archivePath, err := findAvailableArchiveNameLocal(cfg.ArchiveDir, fileName)
 	if err != nil {
 		log.Printf("Erro ao encontrar nome disponível para archive: %v", err)
 		return err
 	}
 
-	err = sftpClient.Rename(filePath, archivePath)
+	err = os.Rename(filePath, archivePath)
 	if err != nil {
 		log.Printf("Erro movendo arquivo pra archive: %v", err)
 		log.Printf("Tentando copiar + deletar como fallback...")
 
-		src, err1 := sftpClient.Open(filePath)
+		src, err1 := os.Open(filePath)
 		if err1 != nil {
 			log.Printf("Erro abrindo arquivo para cópia: %v", err1)
 			return err
 		}
 		defer src.Close()
-		dst, err2 := sftpClient.Create(archivePath)
+		dst, err2 := os.Create(archivePath)
 		if err2 != nil {
 			log.Printf("Erro criando arquivo de destino na archive: %v", err2)
 			return err
@@ -222,7 +204,7 @@ func processFileConcurrent(cfg Config, sftpClient *sftp.Client, fileName string)
 			log.Printf("Erro copiando arquivo: %v", err3)
 			return err
 		}
-		err4 := sftpClient.Remove(filePath)
+		err4 := os.Remove(filePath)
 		if err4 != nil {
 			log.Printf("Erro deletando arquivo original após cópia: %v", err4)
 			return err
@@ -265,7 +247,7 @@ func workerKafka(cfg Config, linesCh <-chan Line, wg *sync.WaitGroup, id int) {
 	}
 }
 
-func findAvailableArchiveName(sftpClient *sftp.Client, archiveDir, fileName string) (string, error) {
+func findAvailableArchiveNameLocal(archiveDir, fileName string) (string, error) {
 	ext := filepath.Ext(fileName)
 	base := strings.TrimSuffix(fileName, ext)
 	for i := 0; ; i++ {
@@ -275,8 +257,8 @@ func findAvailableArchiveName(sftpClient *sftp.Client, archiveDir, fileName stri
 		} else {
 			name = fmt.Sprintf("%s%d%s", base, i, ext)
 		}
-		path := archiveDir + name
-		_, err := sftpClient.Stat(path)
+		path := filepath.Join(archiveDir, name)
+		_, err := os.Stat(path)
 		if os.IsNotExist(err) {
 			return path, nil
 		}
@@ -286,11 +268,11 @@ func findAvailableArchiveName(sftpClient *sftp.Client, archiveDir, fileName stri
 	}
 }
 
-func loadHeaders(sftpClient *sftp.Client, headerPath string) ([]string, error) {
+func loadHeadersLocal(headerPath string) ([]string, error) {
 	log.Printf("DEBUG: Tentando abrir headers: [%s]", headerPath)
-	file, err := sftpClient.Open(headerPath)
+	file, err := os.Open(headerPath)
 	if err != nil {
-		log.Printf("ERRO: Não conseguiu abrir [%s] via SFTP: %v", headerPath, err)
+		log.Printf("ERRO: Não conseguiu abrir [%s]: %v", headerPath, err)
 		return nil, err
 	}
 	defer file.Close()
@@ -324,25 +306,4 @@ func mapLine(header, record []string) map[string]string {
 		}
 	}
 	return row
-}
-
-func connectSFTP(cfg Config) (*sftp.Client, error) {
-	config := &ssh.ClientConfig{
-		User: cfg.SFTPUser,
-		Auth: []ssh.AuthMethod{
-			ssh.Password(cfg.SFTPPassword),
-		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         10 * time.Second,
-	}
-	addr := net.JoinHostPort(cfg.SFTPHost, cfg.SFTPPort)
-	conn, err := ssh.Dial("tcp", addr, config)
-	if err != nil {
-		return nil, fmt.Errorf("SSH dial erro: %w", err)
-	}
-	client, err := sftp.NewClient(conn)
-	if err != nil {
-		return nil, fmt.Errorf("SFTP client erro: %w", err)
-	}
-	return client, nil
 }
