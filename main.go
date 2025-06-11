@@ -171,7 +171,7 @@ func processFileLocalConcurrent(cfg Config, fileName string) error {
 	log.Printf("Total de linhas lidas do arquivo [%s]: %d", fileName, linha-1)
 	log.Printf("Tempo total para processar arquivo [%s]: %s", fileName, time.Since(start))
 
-	// Move para archive
+	// Move para archive com segurança
 	err = os.MkdirAll(cfg.ArchiveDir, 0777)
 	if err != nil {
 		log.Printf("Erro criando diretório archive: %v", err)
@@ -184,30 +184,28 @@ func processFileLocalConcurrent(cfg Config, fileName string) error {
 
 	err = os.Rename(filePath, archivePath)
 	if err != nil {
-		log.Printf("Erro movendo arquivo pra archive: %v", err)
-		log.Printf("Tentando copiar + deletar como fallback...")
-
+		log.Printf("Erro movendo arquivo pra archive (tentando copiar e remover): %v", err)
 		src, err1 := os.Open(filePath)
 		if err1 != nil {
 			log.Printf("Erro abrindo arquivo para cópia: %v", err1)
-			return err
+			return err1
 		}
 		defer src.Close()
 		dst, err2 := os.Create(archivePath)
 		if err2 != nil {
 			log.Printf("Erro criando arquivo de destino na archive: %v", err2)
-			return err
+			return err2
 		}
 		defer dst.Close()
 		_, err3 := io.Copy(dst, src)
 		if err3 != nil {
 			log.Printf("Erro copiando arquivo: %v", err3)
-			return err
+			return err3
 		}
 		err4 := os.Remove(filePath)
 		if err4 != nil {
-			log.Printf("Erro deletando arquivo original após cópia: %v", err4)
-			return err
+			log.Printf("ERRO FATAL: Arquivo foi copiado para archive, MAS NÃO foi removido da origem. Corrija permissões e exclua manualmente. (%v)", err4)
+			return fmt.Errorf("erro removendo arquivo original após cópia: %w", err4)
 		}
 		log.Printf("Arquivo copiado para archive e removido do diretório original! (%s)", archivePath)
 	} else {
