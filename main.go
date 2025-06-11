@@ -84,11 +84,7 @@ func processFileIfExists(cfg Config) error {
 
 	log.Printf("DEBUG: SFTP_DIR=%s, HEADERS_FILENAME=%s, JUNTANDO: %s", cfg.SFTPDir, cfg.HeadersFileName, headersPath)
 
-	header, err := loadHeaders(sftpClient, headersPath)
-	if err != nil {
-		return fmt.Errorf("erro lendo headers.txt: %w", err)
-	}
-
+	// Tenta abrir o arquivo de dados primeiro
 	file, err := sftpClient.Open(filePath)
 	if err != nil {
 		if strings.Contains(err.Error(), "no such file") {
@@ -99,6 +95,31 @@ func processFileIfExists(cfg Config) error {
 	}
 	defer file.Close()
 
+	var header []string
+	// Tenta abrir o headers.txt
+	header, err = loadHeaders(sftpClient, headersPath)
+	if err != nil {
+		log.Printf("Não encontrou headers.txt, usando headers automáticos...")
+		// Lê a primeira linha para contar campos
+		reader := csv.NewReader(file)
+		reader.Comma = ';'
+		firstLine, err2 := reader.Read()
+		if err2 != nil {
+			return fmt.Errorf("erro lendo primeira linha para gerar headers: %w", err2)
+		}
+		// Gera headers automáticos
+		header = make([]string, len(firstLine))
+		for i := range firstLine {
+			header[i] = fmt.Sprintf("field%d", i+1)
+		}
+		// Precisa voltar o ponteiro do arquivo para o início
+		_, errSeek := file.Seek(0, io.SeekStart)
+		if errSeek != nil {
+			return fmt.Errorf("erro ao voltar ponteiro do arquivo: %w", errSeek)
+		}
+	}
+
+	log.Printf("Headers em uso: %+v", header)
 	log.Printf("Processando arquivo %s", filePath)
 
 	brokers := splitComma(cfg.KafkaBrokers)
