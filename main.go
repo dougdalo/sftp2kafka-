@@ -15,11 +15,30 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
+type Line struct {
+	JSON []byte
+}
+
+type Config struct {
+	SFTPUser        string
+	SFTPPassword    string
+	SFTPHost        string
+	SFTPPort        string
+	SFTPDir         string
+	HeadersFileName string
+	ArchiveDir      string
+	KafkaBrokers    []string
+	KafkaTopic      string
+	PollInterval    time.Duration
+	NumWorkers      int
+	BatchSize       int
+}
+
 func main() {
-	// Carrega variáveis do .env
 	if err := godotenv.Load(); err != nil {
 		log.Fatal("Erro ao carregar .env")
 	}
@@ -36,19 +55,6 @@ func main() {
 	}
 }
 
-type Config struct {
-	SFTPUser        string
-	SFTPPassword    string
-	SFTPHost        string
-	SFTPPort        string
-	SFTPDir         string
-	HeadersFileName string
-	ArchiveDir      string
-	KafkaBrokers    string
-	KafkaTopic      string
-	PollInterval    time.Duration
-}
-
 func loadEnvVars() Config {
 	return Config{
 		SFTPUser:        os.Getenv("SFTP_USER"),
@@ -58,16 +64,18 @@ func loadEnvVars() Config {
 		SFTPDir:         os.Getenv("SFTP_DIR"),
 		HeadersFileName: os.Getenv("SFTP_HEADERS_FILENAME"),
 		ArchiveDir:      os.Getenv("SFTP_ARCHIVE_DIR"),
-		KafkaBrokers:    os.Getenv("KAFKA_BROKERS"),
+		KafkaBrokers:    splitComma(os.Getenv("KAFKA_BROKERS")),
 		KafkaTopic:      os.Getenv("KAFKA_TOPIC"),
 		PollInterval:    10 * time.Second,
+		NumWorkers:      8,
+		BatchSize:       2000,
 	}
 }
 
 func printEnvDebug(cfg Config) {
 	fmt.Printf("\nDEBUG VARS:\n"+
-		"SFTP_USER: %s\nSFTP_PASSWORD: %s\nSFTP_HOST: %s\nSFTP_PORT: %s\nSFTP_DIR: %s\nSFTP_HEADERS_FILENAME: %s\nSFTP_ARCHIVE_DIR: %s\nKAFKA_BROKERS: %s\nKAFKA_TOPIC: %s\n\n",
-		cfg.SFTPUser, cfg.SFTPPassword, cfg.SFTPHost, cfg.SFTPPort, cfg.SFTPDir, cfg.HeadersFileName, cfg.ArchiveDir, cfg.KafkaBrokers, cfg.KafkaTopic)
+		"SFTP_USER: %s\nSFTP_PASSWORD: %s\nSFTP_HOST: %s\nSFTP_PORT: %s\nSFTP_DIR: %s\nSFTP_HEADERS_FILENAME: %s\nSFTP_ARCHIVE_DIR: %s\nKAFKA_BROKERS: %v\nKAFKA_TOPIC: %s\nNUM_WORKERS: %d\nBATCH_SIZE: %d\n\n",
+		cfg.SFTPUser, cfg.SFTPPassword, cfg.SFTPHost, cfg.SFTPPort, cfg.SFTPDir, cfg.HeadersFileName, cfg.ArchiveDir, cfg.KafkaBrokers, cfg.KafkaTopic, cfg.NumWorkers, cfg.BatchSize)
 }
 
 func processAllTxtFiles(cfg Config) error {
@@ -82,7 +90,6 @@ func processAllTxtFiles(cfg Config) error {
 		return fmt.Errorf("erro lendo diretório SFTP: %w", err)
 	}
 
-	// Processa todos arquivos *.txt da pasta
 	countFiles := 0
 	for _, file := range files {
 		if file.IsDir() {
@@ -90,7 +97,7 @@ func processAllTxtFiles(cfg Config) error {
 		}
 		if strings.HasSuffix(strings.ToLower(file.Name()), ".txt") {
 			countFiles++
-			err := processFile(cfg, sftpClient, file.Name())
+			err := processFileConcurrent(cfg, sftpClient, file.Name())
 			if err != nil {
 				log.Printf("Erro processando arquivo [%s]: %v", file.Name(), err)
 			}
@@ -103,21 +110,21 @@ func processAllTxtFiles(cfg Config) error {
 	return nil
 }
 
-func processFile(cfg Config, sftpClient *sftp.Client, fileName string) error {
+func processFileConcurrent(cfg Config, sftpClient *sftp.Client, fileName string) error {
 	filePath := cfg.SFTPDir + fileName
 	headersPath := cfg.SFTPDir + cfg.HeadersFileName
 
 	log.Printf("DEBUG: SFTP_DIR=%s, HEADERS_FILENAME=%s, ARQUIVO ATUAL: %s", cfg.SFTPDir, cfg.HeadersFileName, filePath)
 
-	// Abre o arquivo de dados
+	// Abre o arquivo via SFTP
 	file, err := sftpClient.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("erro abrindo arquivo [%s]: %w", fileName, err)
 	}
 	defer file.Close()
 
+	// Lê headers (do headers.txt ou gera automático)
 	var header []string
-	// Tenta abrir o headers.txt (usa para todos os arquivos, se quiser header exclusivo, adapte aqui)
 	header, err = loadHeaders(sftpClient, headersPath)
 	if err != nil {
 		log.Printf("Não encontrou headers.txt, usando headers automáticos para [%s]...", fileName)
@@ -131,7 +138,7 @@ func processFile(cfg Config, sftpClient *sftp.Client, fileName string) error {
 		for i := range firstLine {
 			header[i] = fmt.Sprintf("field%d", i+1)
 		}
-		// Volta o ponteiro pra ler o arquivo todo
+		// Volta o ponteiro pro começo do arquivo
 		_, errSeek := file.Seek(0, io.SeekStart)
 		if errSeek != nil {
 			return fmt.Errorf("erro ao voltar ponteiro do arquivo: %w", errSeek)
@@ -139,17 +146,16 @@ func processFile(cfg Config, sftpClient *sftp.Client, fileName string) error {
 	}
 
 	log.Printf("Headers em uso para [%s]: %+v", fileName, header)
-	log.Printf("Processando arquivo [%s]", filePath)
+	log.Printf("Processando arquivo [%s] em modo concorrente...", filePath)
 
-	brokers := splitComma(cfg.KafkaBrokers)
-	writer := kafka.NewWriter(kafka.WriterConfig{
-		Brokers:      brokers,
-		Topic:        cfg.KafkaTopic,
-		Async:        true,
-		BatchSize:    1000,
-		BatchTimeout: 500 * time.Millisecond,
-	})
-	defer writer.Close()
+	linesCh := make(chan Line, 10000)
+	var wg sync.WaitGroup
+
+	// Inicia workers
+	for i := 0; i < cfg.NumWorkers; i++ {
+		wg.Add(1)
+		go workerKafka(cfg, linesCh, &wg, i)
+	}
 
 	reader := csv.NewReader(file)
 	reader.Comma = ';'
@@ -171,18 +177,19 @@ func processFile(cfg Config, sftpClient *sftp.Client, fileName string) error {
 			log.Printf("Erro convertendo linha %d pra JSON: %v", linha, err)
 			continue
 		}
-		err = writer.WriteMessages(context.Background(),
-			kafka.Message{Value: jsonBytes})
-		if err != nil {
-			log.Printf("Erro enviando pro Kafka linha %d: %v", linha, err)
-		}
+		linesCh <- Line{JSON: jsonBytes}
 		linha++
+		if linha%500000 == 0 {
+			log.Printf("[%s] Linhas lidas até agora: %d", fileName, linha-1)
+		}
 	}
+	close(linesCh)
+	wg.Wait()
 
 	log.Printf("Total de linhas lidas do arquivo [%s]: %d", fileName, linha-1)
 	log.Printf("Tempo total para processar arquivo [%s]: %s", fileName, time.Since(start))
 
-	// Move para archive com nome incremental!
+	// Move para archive como antes
 	err = sftpClient.MkdirAll(cfg.ArchiveDir)
 	if err != nil {
 		log.Printf("Erro criando diretório archive: %v", err)
@@ -198,7 +205,6 @@ func processFile(cfg Config, sftpClient *sftp.Client, fileName string) error {
 		log.Printf("Erro movendo arquivo pra archive: %v", err)
 		log.Printf("Tentando copiar + deletar como fallback...")
 
-		// Copia manualmente e apaga
 		src, err1 := sftpClient.Open(filePath)
 		if err1 != nil {
 			log.Printf("Erro abrindo arquivo para cópia: %v", err1)
@@ -228,7 +234,37 @@ func processFile(cfg Config, sftpClient *sftp.Client, fileName string) error {
 	return nil
 }
 
-// Função para achar um nome disponível (arquivo.txt, arquivo1.txt, ...)
+func workerKafka(cfg Config, linesCh <-chan Line, wg *sync.WaitGroup, id int) {
+	defer wg.Done()
+	writer := kafka.NewWriter(kafka.WriterConfig{
+		Brokers:      cfg.KafkaBrokers,
+		Topic:        cfg.KafkaTopic,
+		Async:        true,
+		BatchSize:    cfg.BatchSize,
+		BatchTimeout: 2 * time.Second,
+	})
+	defer writer.Close()
+
+	messages := make([]kafka.Message, 0, cfg.BatchSize)
+	for line := range linesCh {
+		messages = append(messages, kafka.Message{Value: line.JSON})
+		if len(messages) >= cfg.BatchSize {
+			err := writer.WriteMessages(context.Background(), messages...)
+			if err != nil {
+				log.Printf("[Worker %d] Erro ao escrever batch: %v", id, err)
+			}
+			messages = messages[:0]
+		}
+	}
+	// Envia o resto do batch
+	if len(messages) > 0 {
+		err := writer.WriteMessages(context.Background(), messages...)
+		if err != nil {
+			log.Printf("[Worker %d] Erro ao escrever batch final: %v", id, err)
+		}
+	}
+}
+
 func findAvailableArchiveName(sftpClient *sftp.Client, archiveDir, fileName string) (string, error) {
 	ext := filepath.Ext(fileName)
 	base := strings.TrimSuffix(fileName, ext)
