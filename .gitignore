@@ -1,0 +1,38 @@
+# Não subir variáveis de ambiente sensíveis!
+.env
+
+# Binários de build
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+sftp2kafka
+
+# Diretórios de build temporários
+bin/
+build/
+dist/
+
+# Dependências vendorizadas (se usar)
+vendor/
+
+# Diretórios e arquivos do Go
+*.out
+*.log
+
+# GoLand/JetBrains IDEs
+.idea/
+*.iml
+
+# VSCode
+.vscode/
+
+# Arquivos de cache do Go
+*.mod
+*.sum
+
+# Arquivos de sistema
+.DS_Store
+Thumbs.db
